@@ -701,8 +701,9 @@ args = ["--flag"]
     }
 
     fn assert_live_auth(oauth: &JsonValue) {
-        let auth = crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
-            .expect("read live auth.json");
+        let auth: JsonValue =
+            crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+                .expect("read live auth.json");
         assert_eq!(&auth, oauth, "OAuth material must remain unchanged");
     }
 

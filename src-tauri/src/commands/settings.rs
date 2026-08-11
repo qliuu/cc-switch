@@ -320,12 +320,521 @@ pub async fn set_auto_launch(enabled: bool) -> Result<bool, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::merge_settings_for_save;
+    use super::{merge_settings_for_save, save_settings};
+    use crate::app_config::AppType;
+    use crate::database::{Database, CODEX_OFFICIAL_PROVIDER_ID};
+    use crate::provider::Provider;
+    use crate::proxy::types::ProxyConfig;
     use crate::settings::{
         AppSettings, CodexOfficialHistoryUnifyMigration, CodexProviderTemplateMigration,
         CodexThirdPartyHistoryProviderBucketMigration, LocalMigrations, S3SyncSettings,
         WebDavSyncSettings,
     };
+    use crate::store::AppState;
+    use serde_json::{json, Value as JsonValue};
+    use serial_test::serial;
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::Arc;
+    use tauri::Manager;
+    use tempfile::TempDir;
+
+    const TEST_PROXY_PORT: u16 = 43123;
+    const TEST_PROXY_BASE_URL: &str = "http://127.0.0.1:43123/v1";
+    const OFFICIAL_CONFIG: &str = r#"model = "gpt-5.4"
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+
+[unrelated]
+value = "preserved"
+
+[mcp_servers.fixture]
+command = "fixture-command"
+args = ["--flag"]
+"#;
+    const USER_CUSTOM_CONFIG: &str = r#"model = "gpt-5.4"
+sandbox_mode = "workspace-write"
+approval_policy = "never"
+
+[model_providers.custom]
+name = "User Relay"
+base_url = "https://relay.example/v1"
+wire_api = "responses"
+
+[unrelated]
+value = "preserved"
+
+[mcp_servers.fixture]
+command = "fixture-command"
+args = ["--flag"]
+"#;
+
+    struct TempHome {
+        #[allow(dead_code)]
+        dir: TempDir,
+        original_home: Option<OsString>,
+        #[cfg(windows)]
+        original_local_app_data: Option<OsString>,
+        original_userprofile: Option<OsString>,
+        original_test_home: Option<OsString>,
+    }
+
+    impl TempHome {
+        fn new() -> Self {
+            let dir = TempDir::new().expect("create temp home");
+            let original_home = env::var_os("HOME");
+            #[cfg(windows)]
+            let original_local_app_data = env::var_os("LOCALAPPDATA");
+            let original_userprofile = env::var_os("USERPROFILE");
+            let original_test_home = env::var_os("CC_SWITCH_TEST_HOME");
+
+            env::set_var("HOME", dir.path());
+            #[cfg(windows)]
+            env::set_var("LOCALAPPDATA", dir.path().join("AppData").join("Local"));
+            env::set_var("USERPROFILE", dir.path());
+            env::set_var("CC_SWITCH_TEST_HOME", dir.path());
+
+            Self {
+                dir,
+                original_home,
+                #[cfg(windows)]
+                original_local_app_data,
+                original_userprofile,
+                original_test_home,
+            }
+        }
+    }
+
+    impl Drop for TempHome {
+        fn drop(&mut self) {
+            let _ = crate::settings::update_settings(AppSettings::default());
+
+            restore_env("HOME", self.original_home.take());
+            #[cfg(windows)]
+            restore_env("LOCALAPPDATA", self.original_local_app_data.take());
+            restore_env("USERPROFILE", self.original_userprofile.take());
+            restore_env("CC_SWITCH_TEST_HOME", self.original_test_home.take());
+        }
+    }
+
+    fn restore_env(key: &str, value: Option<OsString>) {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
+    }
+
+    struct CodexTakeoverFixture {
+        app: tauri::App<tauri::test::MockRuntime>,
+        db: Arc<Database>,
+        oauth_auth: JsonValue,
+    }
+
+    async fn setup_official_codex_takeover(config: &str) -> CodexTakeoverFixture {
+        let db = Arc::new(Database::memory().expect("create in-memory database"));
+        db.update_proxy_config(ProxyConfig {
+            live_takeover_active: true,
+            listen_address: "127.0.0.1".to_string(),
+            listen_port: TEST_PROXY_PORT,
+            ..ProxyConfig::default()
+        })
+        .await
+        .expect("configure test proxy endpoint");
+
+        let mut official = Provider::with_id(
+            CODEX_OFFICIAL_PROVIDER_ID.to_string(),
+            "OpenAI Official".to_string(),
+            json!({ "auth": {}, "config": config }),
+            None,
+        );
+        official.category = Some("official".to_string());
+        db.save_provider("codex", &official)
+            .expect("save official provider");
+        db.set_current_provider("codex", CODEX_OFFICIAL_PROVIDER_ID)
+            .expect("set database current provider");
+
+        crate::settings::update_settings(AppSettings {
+            current_provider_codex: Some(CODEX_OFFICIAL_PROVIDER_ID.to_string()),
+            unify_codex_session_history: false,
+            unify_codex_migrate_existing: Some(false),
+            ..AppSettings::default()
+        })
+        .expect("seed test settings");
+
+        let oauth_auth = json!({
+            "auth_mode": "chatgpt",
+            "tokens": {
+                "id_token": "oauth-id",
+                "access_token": "oauth-access"
+            }
+        });
+        let direct_snapshot = json!({
+            "auth": oauth_auth.clone(),
+            "config": config,
+        });
+        db.save_live_backup("codex", &direct_snapshot.to_string())
+            .await
+            .expect("seed direct restore backup");
+
+        let off_live = crate::codex_config::apply_codex_official_proxy_route(
+            config,
+            TEST_PROXY_BASE_URL,
+            false,
+        )
+        .expect("project initial OFF takeover route");
+        crate::codex_config::write_codex_live_atomic(&oauth_auth, Some(&off_live))
+            .expect("seed takeover-owned live files");
+
+        let app = tauri::test::mock_builder()
+            .manage(AppState::new(db.clone()))
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("build mock Tauri app");
+        assert!(
+            app.state::<AppState>()
+                .proxy_service
+                .detect_takeover_in_live_config_for_app(&AppType::Codex),
+            "fixture live config must be recognized as takeover-owned"
+        );
+
+        CodexTakeoverFixture {
+            app,
+            db,
+            oauth_auth,
+        }
+    }
+
+    fn settings_with_unified_history(enabled: bool) -> AppSettings {
+        let mut settings = crate::settings::get_settings();
+        settings.unify_codex_session_history = enabled;
+        settings.unify_codex_migrate_existing = Some(false);
+        settings
+    }
+
+    async fn save_unified_history(
+        app: &tauri::App<tauri::test::MockRuntime>,
+        enabled: bool,
+    ) -> Result<bool, String> {
+        save_settings(
+            app.state::<AppState>(),
+            settings_with_unified_history(enabled),
+        )
+        .await
+    }
+
+    fn set_unified_history(enabled: bool) {
+        crate::settings::update_settings(settings_with_unified_history(enabled))
+            .expect("update unified history setting");
+    }
+
+    fn read_live_toml() -> toml::Value {
+        let config = fs::read_to_string(crate::codex_config::get_codex_config_path())
+            .expect("read live config.toml");
+        toml::from_str(&config).expect("parse live config.toml")
+    }
+
+    async fn read_backup(db: &Database) -> (JsonValue, toml::Value) {
+        let backup = db
+            .get_live_backup(AppType::Codex.as_str())
+            .await
+            .expect("read Codex live backup")
+            .expect("Codex live backup must exist");
+        let snapshot: JsonValue =
+            serde_json::from_str(&backup.original_config).expect("parse backup snapshot");
+        let config = snapshot
+            .get("config")
+            .and_then(JsonValue::as_str)
+            .expect("backup contains config TOML");
+        let config = toml::from_str(config).expect("parse backup config TOML");
+        (snapshot, config)
+    }
+
+    fn active_provider(config: &toml::Value) -> Option<&str> {
+        config.get("model_provider").and_then(toml::Value::as_str)
+    }
+
+    fn provider_entry<'a>(config: &'a toml::Value, id: &str) -> Option<&'a toml::Value> {
+        config
+            .get("model_providers")
+            .and_then(toml::Value::as_table)
+            .and_then(|providers| providers.get(id))
+    }
+
+    fn assert_unrelated_config_preserved(config: &toml::Value) {
+        assert_eq!(
+            config.get("model").and_then(toml::Value::as_str),
+            Some("gpt-5.4")
+        );
+        assert_eq!(
+            config.get("sandbox_mode").and_then(toml::Value::as_str),
+            Some("workspace-write")
+        );
+        assert_eq!(
+            config.get("approval_policy").and_then(toml::Value::as_str),
+            Some("never")
+        );
+        assert_eq!(config["unrelated"]["value"].as_str(), Some("preserved"));
+        assert_eq!(
+            config["mcp_servers"]["fixture"]["command"].as_str(),
+            Some("fixture-command")
+        );
+    }
+
+    fn assert_routed_off(config: &toml::Value, expect_user_custom: bool) {
+        assert_eq!(
+            active_provider(config),
+            Some(crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID)
+        );
+        let marker = provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+        )
+        .expect("OFF live keeps official ownership marker");
+        assert_eq!(
+            marker.get("base_url").and_then(toml::Value::as_str),
+            Some(TEST_PROXY_BASE_URL)
+        );
+        assert_eq!(
+            marker
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            marker
+                .get("supports_websockets")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            provider_entry(
+                config,
+                crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID
+            )
+            .is_some(),
+            expect_user_custom
+        );
+        assert_unrelated_config_preserved(config);
+    }
+
+    fn assert_routed_on(config: &toml::Value) {
+        assert_eq!(
+            active_provider(config),
+            Some(crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        );
+        let custom = provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+        )
+        .expect("ON live uses shared custom route");
+        let marker = provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID,
+        )
+        .expect("ON live retains inactive ownership marker");
+        assert_eq!(custom, marker, "owned marker must mirror routed custom");
+        assert_eq!(
+            custom.get("base_url").and_then(toml::Value::as_str),
+            Some(TEST_PROXY_BASE_URL)
+        );
+        assert_eq!(
+            custom
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            custom
+                .get("supports_websockets")
+                .and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_unrelated_config_preserved(config);
+    }
+
+    fn assert_direct_backup_off(snapshot: &JsonValue, config: &toml::Value, oauth: &JsonValue) {
+        assert_eq!(snapshot.get("auth"), Some(oauth));
+        assert!(active_provider(config).is_none());
+        assert!(provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID
+        )
+        .is_none());
+        assert!(provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID
+        )
+        .is_none());
+        assert_unrelated_config_preserved(config);
+    }
+
+    fn assert_direct_backup_on(snapshot: &JsonValue, config: &toml::Value, oauth: &JsonValue) {
+        assert_eq!(snapshot.get("auth"), Some(oauth));
+        assert_eq!(
+            active_provider(config),
+            Some(crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID)
+        );
+        let custom = provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+        )
+        .expect("ON backup uses direct shared custom identity");
+        assert!(custom.get("base_url").is_none());
+        assert_eq!(
+            custom
+                .get("requires_openai_auth")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            custom
+                .get("supports_websockets")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert!(provider_entry(
+            config,
+            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID
+        )
+        .is_none());
+        assert_unrelated_config_preserved(config);
+    }
+
+    fn assert_live_auth(oauth: &JsonValue) {
+        let auth = crate::config::read_json_file(&crate::codex_config::get_codex_auth_path())
+            .expect("read live auth.json");
+        assert_eq!(&auth, oauth, "OAuth material must remain unchanged");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn save_settings_reprojects_active_official_takeover_round_trip_and_rolls_back_custom_conflict(
+    ) {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let fixture = setup_official_codex_takeover(OFFICIAL_CONFIG).await;
+
+        assert_routed_off(&read_live_toml(), false);
+        assert_live_auth(&fixture.oauth_auth);
+
+        save_unified_history(&fixture.app, true)
+            .await
+            .expect("save OFF -> ON");
+        assert!(crate::settings::unify_codex_session_history());
+        assert_routed_on(&read_live_toml());
+        assert_live_auth(&fixture.oauth_auth);
+
+        save_unified_history(&fixture.app, false)
+            .await
+            .expect("save ON -> OFF");
+        assert!(!crate::settings::unify_codex_session_history());
+        assert_routed_off(&read_live_toml(), false);
+
+        save_unified_history(&fixture.app, true)
+            .await
+            .expect("save OFF -> ON again");
+        assert!(crate::settings::unify_codex_session_history());
+        assert_routed_on(&read_live_toml());
+
+        save_unified_history(&fixture.app, false)
+            .await
+            .expect("return to OFF before conflict injection");
+        let mut official = fixture
+            .db
+            .get_provider_by_id(CODEX_OFFICIAL_PROVIDER_ID, AppType::Codex.as_str())
+            .expect("read official provider")
+            .expect("official provider exists");
+        official.settings_config = json!({ "auth": {}, "config": USER_CUSTOM_CONFIG });
+        fixture
+            .db
+            .save_provider(AppType::Codex.as_str(), &official)
+            .expect("inject user-owned custom conflict");
+
+        let error = save_unified_history(&fixture.app, true)
+            .await
+            .expect_err("user-owned custom must fail closed");
+        assert!(
+            error.contains("统一 Codex 会话历史开关未生效") && error.contains("custom"),
+            "unexpected rollback error: {error}"
+        );
+        assert!(
+            !crate::settings::unify_codex_session_history(),
+            "failed ON save must roll the setting back to OFF"
+        );
+
+        let live = read_live_toml();
+        assert_routed_off(&live, true);
+        let user_custom = provider_entry(
+            &live,
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+        )
+        .expect("user custom survives rollback");
+        assert_eq!(
+            user_custom.get("name").and_then(toml::Value::as_str),
+            Some("User Relay")
+        );
+        assert_eq!(
+            user_custom.get("base_url").and_then(toml::Value::as_str),
+            Some("https://relay.example/v1")
+        );
+        assert_live_auth(&fixture.oauth_auth);
+
+        let (backup_snapshot, backup_config) = read_backup(&fixture.db).await;
+        assert_eq!(backup_snapshot.get("auth"), Some(&fixture.oauth_auth));
+        assert!(active_provider(&backup_config).is_none());
+        let backup_custom = provider_entry(
+            &backup_config,
+            crate::codex_config::CC_SWITCH_CODEX_MODEL_PROVIDER_ID,
+        )
+        .expect("backup retains user custom");
+        assert_eq!(
+            backup_custom.get("name").and_then(toml::Value::as_str),
+            Some("User Relay")
+        );
+        assert_eq!(
+            backup_custom.get("base_url").and_then(toml::Value::as_str),
+            Some("https://relay.example/v1")
+        );
+        assert!(provider_entry(
+            &backup_config,
+            crate::codex_config::CC_SWITCH_CODEX_OFFICIAL_PROXY_PROVIDER_ID
+        )
+        .is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn reapply_current_codex_official_live_round_trips_active_takeover_and_backup() {
+        let _home = TempHome::new();
+        crate::settings::reload_settings().expect("reload isolated settings");
+        let fixture = setup_official_codex_takeover(OFFICIAL_CONFIG).await;
+        let state = fixture.app.state::<AppState>();
+
+        assert_routed_off(&read_live_toml(), false);
+        let (backup_snapshot, backup_config) = read_backup(&fixture.db).await;
+        assert_direct_backup_off(&backup_snapshot, &backup_config, &fixture.oauth_auth);
+
+        for enabled in [true, false, true] {
+            set_unified_history(enabled);
+            assert!(
+                crate::services::provider::reapply_current_codex_official_live(state.inner())
+                    .expect("reapply official live"),
+                "official provider should be reapplied"
+            );
+            assert_eq!(crate::settings::unify_codex_session_history(), enabled);
+
+            let live = read_live_toml();
+            let (backup_snapshot, backup_config) = read_backup(&fixture.db).await;
+            if enabled {
+                assert_routed_on(&live);
+                assert_direct_backup_on(&backup_snapshot, &backup_config, &fixture.oauth_auth);
+            } else {
+                assert_routed_off(&live, false);
+                assert_direct_backup_off(&backup_snapshot, &backup_config, &fixture.oauth_auth);
+            }
+            assert_live_auth(&fixture.oauth_auth);
+        }
+    }
 
     #[test]
     fn save_settings_should_preserve_existing_webdav_when_payload_omits_it() {

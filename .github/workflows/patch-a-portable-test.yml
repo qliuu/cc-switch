@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: patch-a-portable-test
+  cancel-in-progress: true
+
 jobs:
   windows-portable:
     runs-on: windows-2022
@@ -65,6 +69,16 @@ jobs:
             "bundle": {
               "active": false,
               "createUpdaterArtifacts": false
+            },
+            "plugins": {
+              "deep-link": {
+                "desktop": {
+                  "schemes": ["ccswitch-patchatest"]
+                }
+              },
+              "updater": {
+                "endpoints": ["https://127.0.0.1:9/latest.json"]
+              }
             }
           }
           '@ | Set-Content -LiteralPath $testConfig -Encoding utf8
@@ -91,6 +105,7 @@ jobs:
             'source_sha=cc8125df4b61a98b5d2d59bb1a91a2c917b3322f',
             'branch=fix/codex-unified-history-provider-identity',
             'identifier=com.ccswitch.patchatest',
+            'deep_link_scheme=ccswitch-patchatest',
             'signed=false',
             "workflow_run=$env:GITHUB_RUN_ID"
           ) | Set-Content -LiteralPath (Join-Path $artifactDir 'BUILD-METADATA.txt') -Encoding utf8

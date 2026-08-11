@@ -84,6 +84,12 @@ pub async fn save_settings(
             log::warn!("统一 Codex 会话历史开关变更后重写 live 配置失败，回滚设置: {err}");
             if let Err(rollback_err) = crate::settings::update_settings(existing) {
                 log::error!("回滚统一会话开关设置失败: {rollback_err}");
+            } else if let Err(rollback_live_err) =
+                crate::services::provider::reapply_current_codex_official_live(state.inner())
+            {
+                // 接管态重投影会先更新恢复备份、再更新活动 live。若第二步失败，
+                // 按旧设置再应用一次可把可能已更新的备份恢复到旧桶语义。
+                log::error!("回滚统一会话开关后恢复 Codex live/备份失败: {rollback_live_err}");
             }
             return Err(format!(
                 "统一 Codex 会话历史开关未生效（live 配置重写失败）: {err}"

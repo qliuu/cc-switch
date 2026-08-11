@@ -69,8 +69,8 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
     }
 
     // 代理接管期间 live 归代理所有（开启代理时官方供应商只警告不拦截，
-    // 二者可以共存）。与切换/保存路径一致：以 backup/占位符为所有权信号，
-    // 只更新备份，注入后的配置由接管释放时的恢复路径落盘。
+    // 二者可以共存）。先更新恢复用备份；若 live 正在接管，还要立即按新开关
+    // 状态重投影活动代理路由，否则开关只会在将来释放接管时才生效。
     let has_live_backup =
         futures::executor::block_on(state.db.get_live_backup(AppType::Codex.as_str()))
             .ok()
@@ -86,6 +86,14 @@ pub fn reapply_current_codex_official_live(state: &AppState) -> Result<bool, App
                 .update_live_backup_from_provider(AppType::Codex.as_str(), provider),
         )
         .map_err(|e| AppError::Message(format!("更新 Live 备份失败: {e}")))?;
+        if live_taken_over {
+            futures::executor::block_on(
+                state
+                    .proxy_service
+                    .sync_codex_live_from_provider_while_proxy_active(provider),
+            )
+            .map_err(|e| AppError::Message(format!("重投影 Codex 官方代理配置失败: {e}")))?;
+        }
         return Ok(true);
     }
 

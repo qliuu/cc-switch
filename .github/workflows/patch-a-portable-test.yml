@@ -1,0 +1,106 @@
+name: Patch A portable test artifact
+
+on:
+  push:
+    branches:
+      - ci/patch-a-portable-build
+
+permissions:
+  contents: read
+
+jobs:
+  windows-portable:
+    runs-on: windows-2022
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout validated Patch A source
+        uses: actions/checkout@v6
+        with:
+          ref: cc8125df4b61a98b5d2d59bb1a91a2c917b3322f
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        shell: pwsh
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Setup project Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - name: Cache dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+            ~/.pnpm-store
+          key: patch-a-portable-${{ runner.os }}-${{ hashFiles('src-tauri/Cargo.lock', 'pnpm-lock.yaml') }}
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build unsigned raw executable with isolated app identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testConfig = Join-Path $env:RUNNER_TEMP 'patch-a-tauri.conf.json'
+          @'
+          {
+            "productName": "CC Switch Patch A Test",
+            "identifier": "com.ccswitch.patchatest",
+            "bundle": {
+              "active": false,
+              "createUpdaterArtifacts": false
+            }
+          }
+          '@ | Set-Content -LiteralPath $testConfig -Encoding utf8
+          pnpm tauri build --target x86_64-pc-windows-msvc --no-bundle --config $testConfig
+
+      - name: Prepare portable test artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $artifactDir = Join-Path $env:RUNNER_TEMP 'patch-a-portable'
+          New-Item -ItemType Directory -Path $artifactDir -Force | Out-Null
+          $exePath = 'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe'
+          Copy-Item -LiteralPath $exePath -Destination $artifactDir
+          $signature = Get-AuthenticodeSignature -LiteralPath $exePath
+          if ($signature.Status -ne 'NotSigned') {
+            throw "Expected unsigned test executable, got Authenticode status: $($signature.Status)"
+          }
+          @(
+            '# CC Switch Patch A isolated portable test marker',
+            'portable=true',
+            'test_identifier=com.ccswitch.patchatest'
+          ) | Set-Content -LiteralPath (Join-Path $artifactDir 'portable.ini') -Encoding utf8
+          @(
+            'source_sha=cc8125df4b61a98b5d2d59bb1a91a2c917b3322f',
+            'branch=fix/codex-unified-history-provider-identity',
+            'identifier=com.ccswitch.patchatest',
+            'signed=false',
+            "workflow_run=$env:GITHUB_RUN_ID"
+          ) | Set-Content -LiteralPath (Join-Path $artifactDir 'BUILD-METADATA.txt') -Encoding utf8
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $artifactDir 'cc-switch.exe')).Hash.ToLowerInvariant()
+          "$hash  cc-switch.exe" | Set-Content -LiteralPath (Join-Path $artifactDir 'SHA256SUMS.txt') -Encoding ascii
+
+      - name: Upload isolated portable artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: cc-switch-patch-a-windows-x64-portable
+          path: ${{ runner.temp }}/patch-a-portable/*
+          if-no-files-found: error
+          retention-days: 7
